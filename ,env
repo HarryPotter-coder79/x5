@@ -1,0 +1,25 @@
+# Example environment variables for whatsapp-bot
+SESSION_ID=your-session-id
+KATABUMP_MODE=0
+SKIP_WHATSAPP=0
+
+# API Bridge Settings (for Telegram bot to connect to WhatsApp bot)
+WHATSAPP_API_URL=http://localhost:3000
+WHATSAPP_API_KEY=x5-bot-api-key-2025
+UPDATE_ZIP_URL=
+WARN_THRESHOLD=3
+PORT=3000
+GPT_KEY=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
+GEMINI_KEY=AIzaSyA8xPlstdsUSsWef4l61iWBDZ9ymhSCF8Y
+# Comma-separated fallback AI providers (used when OpenAI fails)
+FALLBACK_AI_PROVIDERS=https://vapis.my.id/api/gemini?q=,https://api.ryzendesu.vip/api/ai/gemini?text=,https://api.giftedtech.my.id/api/ai/geminiai?apikey=gifted&q=
+# Controls for GPT fallbacks and blacklist:
+# When FALLBACK_ON_GPT_ERROR is true, GPT will try the providers listed in FALLBACK_AI_PROVIDERS or FALLBACK_AI_PROVIDERS_GPT on OpenAI failures.
+FALLBACK_ON_GPT_ERROR=false
+# Optionally set a GPT-specific list (comma-separated). If set, GPT uses these instead of FALLBACK_AI_PROVIDERS.
+FALLBACK_AI_PROVIDERS_GPT=
+# Comma-separated substrings to blacklist providers (e.g., zellapi)
+BLACKLISTED_FALLBACKS=zellapi
+# Optional vault secret (do NOT commit this to version control). If set, the bot will try to decrypt stored vault key using this secret.
+AI_KEY_VAULT_SECRET=
+# Vault behavior: when using `.setaikey --vault <key>`, the key is encrypted with the above secret and saved to secrets/ai_key.enc
