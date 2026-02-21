@@ -1,3 +1,4 @@
+// v2
 module.exports = {
     OWNER_JIDS: ['2349051579932@s.whatsapp.net'],
     SUDO_JIDS: ['2349051579932@s.whatsapp.net'],
