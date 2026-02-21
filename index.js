@@ -24,7 +24,10 @@ const chalk = require('chalk')
 const FileType = require('file-type')
 const path = require('path')
 const axios = require('axios')
+const express = require('express')
 const qrcode = require('qrcode-terminal')
+
+// Website pairing removed - only bot terminal pairing is used
 
 // Defensive: polyfill global File when not defined (some runtimes or older Node binaries used by PM2 may not have it)
 if (typeof File === 'undefined') {
@@ -134,13 +137,25 @@ setInterval(() => {
     }
 }, 30_000) // check every 30 seconds
 
-let phoneNumber = "911234567890"
+// PHONE NUMBER - Change this to your number or leave empty to be prompted
+let phoneNumber = process.env.PHONE_NUMBER || ""
 let owner = JSON.parse(fs.readFileSync('./data/owner.json'))
+global.owner = owner  // Make globally accessible
 
 global.botname = "X5 Bot"
 global.themeemoji = "•"
-const pairingCode = !!phoneNumber || process.argv.includes("--pairing-code")
+
+// Determine connection mode from command line or phone number
+const usePairingCode = !!phoneNumber || process.argv.includes("--pairing-code") || process.argv.includes("--pair")
 const useMobile = process.argv.includes("--mobile")
+const useQR = process.argv.includes("--qr") || (!usePairingCode && !useMobile)
+
+// Track bot state to prevent repeated restarts while connected
+let botConnected = false
+let isRestarting = false
+let socketReady = false // Track when WebSocket is fully ready for pairing code
+let pairingPromptActive = false // Prevent duplicate terminal prompts for pairing
+let pairingRequested = false // True once we've requested a pairing code to avoid re-requesting
 
 // Only create readline interface if we're in an interactive environment
 const rl = process.stdin.isTTY ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null
@@ -153,6 +168,93 @@ const question = (text) => {
     }
 }
 
+// ========================================
+// MULTI-USER SESSION MANAGEMENT
+// ========================================
+const sessionsFile = path.join(__dirname, 'data', 'sessions.json')
+
+function loadSessions() {
+    try {
+        if (fs.existsSync(sessionsFile)) {
+            return JSON.parse(fs.readFileSync(sessionsFile, 'utf8'))
+        }
+    } catch (e) {
+        console.error('Error loading sessions:', e.message)
+    }
+    return { activeSessions: [], lastActiveSession: null, sessionHistory: [] }
+}
+
+function saveSessions(data) {
+    try {
+        if (!fs.existsSync(path.dirname(sessionsFile))) {
+            fs.mkdirSync(path.dirname(sessionsFile), { recursive: true })
+        }
+        fs.writeFileSync(sessionsFile, JSON.stringify(data, null, 2), 'utf8')
+    } catch (e) {
+        console.error('Error saving sessions:', e.message)
+    }
+}
+
+function addOrUpdateSession(phoneNumber, sessionFolderName) {
+    const sessions = loadSessions()
+    const sessionIndex = sessions.activeSessions.findIndex(s => s.phoneNumber === phoneNumber)
+    
+    if (sessionIndex >= 0) {
+        sessions.activeSessions[sessionIndex] = {
+            phoneNumber,
+            sessionFolder: sessionFolderName,
+            connectedAt: sessions.activeSessions[sessionIndex].connectedAt,
+            lastActive: Date.now()
+        }
+    } else {
+        sessions.activeSessions.push({
+            phoneNumber,
+            sessionFolder: sessionFolderName,
+            connectedAt: Date.now(),
+            lastActive: Date.now()
+        })
+    }
+    
+    sessions.lastActiveSession = phoneNumber
+    saveSessions(sessions)
+    console.log(chalk.green(`✅ Session persisted for ${phoneNumber}`))
+    
+    // Also add to owner.json for multi-user support
+    try {
+        const ownerFile = path.join(__dirname, 'data', 'owner.json')
+        let owners = []
+        
+        if (fs.existsSync(ownerFile)) {
+            try {
+                owners = JSON.parse(fs.readFileSync(ownerFile, 'utf8'))
+                if (!Array.isArray(owners)) owners = [owners]
+            } catch (e) {
+                owners = []
+            }
+        }
+        
+        // Add if not already present
+        if (!owners.includes(phoneNumber)) {
+            owners.push(phoneNumber)
+            fs.writeFileSync(ownerFile, JSON.stringify(owners, null, 2), 'utf8')
+            console.log(chalk.green(`✅ Added ${phoneNumber} to owner.json`))
+        }
+    } catch (e) {
+        console.error('Error updating owner.json:', e.message)
+    }
+}
+
+function getSessionFolder(phoneNumber) {
+    const sessions = loadSessions()
+    const existing = sessions.activeSessions.find(s => s.phoneNumber === phoneNumber)
+    return existing?.sessionFolder || `./sessions/${phoneNumber}`
+}
+
+function getAllActiveSessions() {
+    return loadSessions().activeSessions
+}
+
+// ========================================
 
 async function startXeonBotInc() {
     try {
@@ -172,17 +274,66 @@ async function startXeonBotInc() {
             proto,
             jidNormalizedUser,
             makeCacheableSignalKeyStore,
-            delay
+            delay: baileyDelay
         } = baileys
+        
+        // Fallback delay if not available from Baileys
+        const delay = baileyDelay || ((ms) => new Promise(resolve => setTimeout(resolve, ms)))
 
         let { version, isLatest } = await fetchLatestBaileysVersion()
-        const { state, saveCreds } = await useMultiFileAuthState(`./session`)
+        
+        // Multi-user session support: Use last active session or default
+        const activeSessions = getAllActiveSessions()
+        let sessionPath = path.resolve(`./session`)  // Use absolute path
+        
+        // PRIORITY 1: If there are active sessions, reconnect to them (regardless of --pair flag)
+        if (activeSessions.length > 0 && !phoneNumber) {
+            // Reconnect to last active session if available
+            const lastActive = activeSessions[activeSessions.length - 1]
+            sessionPath = path.resolve(lastActive.sessionFolder)
+            console.log(chalk.cyan(`🔄 Reconnecting to previous session: +${lastActive.phoneNumber}`))
+            
+            if (activeSessions.length > 1) {
+                console.log(chalk.yellow(`\n📱 Available sessions (${activeSessions.length}):`))
+                activeSessions.forEach((s, i) => console.log(chalk.yellow(`   ${i + 1}. +${s.phoneNumber}`)))
+            }
+        } else if (phoneNumber) {
+            // PRIORITY 2: If a phone number is provided via env, use it
+            sessionPath = path.resolve(getSessionFolder(phoneNumber))
+        }
+        // PRIORITY 3: Otherwise use default session (for new pairing or QR mode)
+        
+        // Create session directory with proper error handling
+        if (!fs.existsSync(sessionPath)) {
+            fs.mkdirSync(sessionPath, { recursive: true, mode: 0o755 })
+            console.log(chalk.green(`✅ Created session directory: ${sessionPath}`))
+        }
+        
+        // Make session path globally accessible for debug-bridge pairing
+        global.currentSessionPath = sessionPath
+        
+        const { state, saveCreds } = await useMultiFileAuthState(sessionPath).catch(err => {
+            if (err.code === 'ENOENT' || err.message.includes('creds.json')) {
+                // Session file is corrupted or missing, delete and recreate
+                console.log(chalk.yellow('⚠️ Session corrupted. Clearing and re-authenticating...'))
+                try {
+                    if (fs.existsSync(sessionPath)) {
+                        fs.rmSync(sessionPath, { recursive: true, force: true })
+                        fs.mkdirSync(sessionPath, { recursive: true })
+                    }
+                } catch (e) {
+                    // Continue anyway
+                }
+                return useMultiFileAuthState(sessionPath)
+            }
+            throw err
+        })
         const msgRetryCounterCache = new NodeCache()
 
         const XeonBotInc = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
-            printQRInTerminal: !pairingCode,
+            printQRInTerminal: useQR, // Only print QR if using QR mode
             browser: ["Ubuntu", "Chrome", "20.0.04"],
             auth: {
                 creds: state.creds,
@@ -197,15 +348,53 @@ async function startXeonBotInc() {
                 return msg?.message || ""
             },
             msgRetryCounterCache,
-            defaultQueryTimeoutMs: 60000,
-            connectTimeoutMs: 60000,
-            keepAliveIntervalMs: 10000,
+            // Optimized timeout values for better connection stability
+            defaultQueryTimeoutMs: 90000,        // Increased from 60s to 90s
+            connectTimeoutMs: 90000,              // Increased from 60s to 90s
+            keepAliveIntervalMs: 15000,           // Increased from 10s to 15s
+            retryRequestDelayMs: 5000,            // Retry delay for failed requests
+            shouldIgnoreJid: (jid) => jid.includes('@broadcast'), // Ignore broadcast messages
+            shouldSyncHistoryMessage: () => false,  // Don't sync history on reconnect
         })
+
+        // Expose the live bot instance to this process so internal APIs can use it
+        try { global.XeonBotInc = XeonBotInc } catch (e) {}
+
+        // --- Internal HTTP API for web server to request pairing codes ---
+        try {
+            const internalPort = process.env.INTERNAL_PORT || 4001;
+            const internalApp = express();
+            internalApp.use(express.json());
+
+            internalApp.post('/request-pair', async (req, res) => {
+                try {
+                    const phoneNumber = (req.body && req.body.phoneNumber) || req.query.phoneNumber;
+                    if (!phoneNumber) return res.status(400).json({ success: false, message: 'phoneNumber required' });
+                    // Clean number
+                    const clean = String(phoneNumber).replace(/[^0-9]/g, '');
+                    const code = await XeonBotInc.requestPairingCode(clean);
+                    return res.json({ success: true, code });
+                } catch (err) {
+                    console.error('Internal /request-pair error:', err && err.message ? err.message : err);
+                    return res.status(500).json({ success: false, message: err && err.message ? err.message : String(err) });
+                }
+            });
+
+            internalApp.get('/', (req, res) => res.json({ ok: true }));
+
+            internalApp.listen(internalPort, () => {
+                console.log(chalk.cyan(`🔒 Internal bot API running on http://127.0.0.1:${internalPort}`));
+            });
+        } catch (e) {
+            console.error('Failed to start internal API:', e && e.message ? e.message : e);
+        }
 
         // Save credentials when they update
         XeonBotInc.ev.on('creds.update', saveCreds)
 
     store.bind(XeonBotInc.ev)
+
+
 
     // Message handling
     XeonBotInc.ev.on('messages.upsert', async chatUpdate => {
@@ -217,6 +406,9 @@ async function startXeonBotInc() {
                 await handleStatus(XeonBotInc, chatUpdate);
                 return;
             }
+            
+
+            
             // In private mode, only block non-group messages (allow groups for moderation)
             // Note: XeonBotInc.public is not synced, so we check mode in main.js instead
             // This check is kept for backward compatibility but mainly blocks DMs
@@ -289,61 +481,152 @@ async function startXeonBotInc() {
 
     XeonBotInc.serializeM = (m) => smsg(XeonBotInc, m, store)
 
-    // Handle pairing code
-    if (pairingCode && !XeonBotInc.authState.creds.registered) {
-        if (useMobile) throw new Error('Cannot use pairing code with mobile api')
-
-        let phoneNumber
-        if (!!global.phoneNumber) {
-            phoneNumber = global.phoneNumber
-        } else {
-            phoneNumber = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 6281376552730 (without + or spaces) : `)))
-        }
-
-        // Clean the phone number - remove any non-digit characters
-        phoneNumber = phoneNumber.replace(/[^0-9]/g, '')
-
-        // Validate the phone number using awesome-phonenumber
-        const pn = require('awesome-phonenumber');
-        if (!pn('+' + phoneNumber).isValid()) {
-            console.log(chalk.red('Invalid phone number. Please enter your full international number (e.g., 15551234567 for US, 447911123456 for UK, etc.) without + or spaces.'));
-            process.exit(1);
-        }
-
-        setTimeout(async () => {
-            try {
-                let code = await XeonBotInc.requestPairingCode(phoneNumber)
-                code = code?.match(/.{1,4}/g)?.join("-") || code
-                console.log(chalk.black(chalk.bgGreen(`Your Pairing Code : `)), chalk.black(chalk.white(code)))
-                console.log(chalk.yellow(`\nPlease enter this code in your WhatsApp app:\n1. Open WhatsApp\n2. Go to Settings > Linked Devices\n3. Tap "Link a Device"\n4. Enter the code shown above`))
-            } catch (error) {
-                console.error('Error requesting pairing code:', error)
-                console.log(chalk.red('Failed to get pairing code. Please check your phone number and try again.'))
-            }
-        }, 3000)
-    }
-
-    // Connection handling
-    XeonBotInc.ev.on('connection.update', async (s) => {
-        const { connection, lastDisconnect, qr } = s
+    // Connection handling with QR and Pairing Code support
+    XeonBotInc.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr, isNewLogin } = update
         
-        if (qr) {
-            console.log(chalk.yellow('📱 QR Code generated. Please scan with WhatsApp.'))
+        // Handle QR Code generation
+        if (qr && useQR) {
+            console.log(chalk.yellow('\n📱 QR Code generated\n'))
             try {
-                qrcode.generate(qr, { small: true }, (code) => console.log(code))
+                qrcode.generate(qr, { small: true })
             } catch (e) {
                 console.error('Error generating terminal QR:', e)
             }
 
-            // Also save QR as PNG to assets for scanning from this machine
+            // Save QR as PNG
             try {
                 const QR = require('qrcode')
-                const outPath = path.join(__dirname, 'assets', `pair-${Date.now()}.png`)
+                if (!fs.existsSync('./assets')) fs.mkdirSync('./assets', { recursive: true })
+                const outPath = path.join(__dirname, 'assets', `qr-${Date.now()}.png`)
+                const latestPath = path.join(__dirname, 'assets', `qr-latest.png`)
                 await QR.toFile(outPath, qr, { type: 'png', width: 400 })
-                console.log(chalk.green(`📁 QR saved to: ${outPath}`))
+                // Also write a copy as qr-latest.png for external web server to read
+                await QR.toFile(latestPath, qr, { type: 'png', width: 400 })
+                // Save raw QR string for fallback
+                try { fs.writeFileSync(path.join(__dirname, 'assets', 'latest-qr.txt'), String(qr), 'utf8') } catch (e) {}
+                // Make latest QR available globally
+                try { global.latestQR = String(qr) } catch (e) {}
+                console.log(chalk.green(`📁 QR code saved to: ${outPath}\n`))
             } catch (e) {
                 console.error('Error saving QR PNG:', e)
             }
+        }
+
+        // Handle Pairing Code
+        if (usePairingCode && !XeonBotInc.authState.creds.registered && connection !== 'open') {
+            if (useMobile) {
+                console.log(chalk.red('❌ Cannot use pairing code with mobile API'))
+                process.exit(1)
+            }
+
+            let pairNumber = phoneNumber
+            
+            // If no phone number provided, prompt the user in terminal for their number
+            if (!pairNumber) {
+                if (pairingPromptActive || pairingRequested) return // already prompting/requested elsewhere
+                pairingPromptActive = true
+                try {
+                    const rlInterface = readline.createInterface({ input: process.stdin, output: process.stdout });
+                    const ask = (q) => new Promise(resolve => rlInterface.question(q, ans => resolve(ans.trim())));
+                    pairNumber = await ask('📱 Enter phone number (international, without + or spaces): ');
+                    rlInterface.close();
+                } catch (e) {
+                    pairNumber = ''
+                }
+                if (!pairNumber) {
+                    console.log(chalk.yellow('No phone number entered. Falling back to QR mode.'))
+                    pairingPromptActive = false
+                    return
+                }
+            }
+
+            // Clean the phone number
+            pairNumber = pairNumber.replace(/[^0-9]/g, '')
+
+            // Validate phone number
+            const pn = require('awesome-phonenumber')
+            if (!pn('+' + pairNumber).isValid()) {
+                console.log(chalk.red('\n❌ Invalid phone number format!'))
+                console.log(chalk.yellow('Please enter your full international number without + or spaces'))
+                console.log(chalk.yellow('Examples:'))
+                console.log(chalk.yellow('  • US: 15551234567'))
+                console.log(chalk.yellow('  • UK: 447911123456'))
+                console.log(chalk.yellow('  • Nigeria: 2348012345678\n'))
+                process.exit(1)
+            }
+
+            console.log(chalk.cyan(`\n✓ Valid number: +${pairNumber}`))
+            console.log(chalk.yellow('⏳ Requesting pairing code...\n'))
+
+            // Request pairing code (don't wait for socket, just try directly)
+            const maxAttempts = 3
+            let attempts = 0
+            
+            const requestCode = async () => {
+                try {
+                    // Just try to request the pairing code directly - no strict socket check
+                    // This allows WhatsApp to handle the connection internally
+                    attempts++
+                    console.log(chalk.yellow(`📱 Requesting pairing code (attempt ${attempts}/${maxAttempts})...\n`))
+                    
+                    // Add a timeout wrapper to prevent hanging
+                    const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Pairing code request timeout - WhatsApp server not responding')), 50000)
+                    )
+                    
+                    // Request the pairing code
+                    let code = await Promise.race([
+                        XeonBotInc.requestPairingCode(pairNumber),
+                        timeoutPromise
+                    ])
+                    code = code?.match(/.{1,4}/g)?.join("-") || code
+                    
+                    console.log(chalk.green('\n╔════════════════════════════════════════╗'))
+                    console.log(chalk.green('║         YOUR PAIRING CODE              ║'))
+                    console.log(chalk.green('╠════════════════════════════════════════╣'))
+                    console.log(chalk.green('║                                        ║'))
+                    console.log(chalk.green(`║          ${chalk.bold.white(code)}           ║`))
+                    console.log(chalk.green('║                                        ║'))
+                    console.log(chalk.green('╚════════════════════════════════════════╝\n'))
+                    
+                    console.log(chalk.cyan('📱 To link your device:\n'))
+                    console.log(chalk.white('   1. Open WhatsApp on your phone'))
+                    console.log(chalk.white('   2. Go to Settings → Linked Devices'))
+                    console.log(chalk.white('   3. Tap "Link a Device"'))
+                    console.log(chalk.white('   4. Enter the code above\n'))
+                    
+                    pairingPromptActive = false
+                } catch (error) {
+                    console.error(chalk.red('\n❌ Pairing code error:'), error.message)
+                    
+                    if (attempts < maxAttempts) {
+                        console.log(chalk.yellow(`\n⏳ Retrying in 5 seconds... (${attempts}/${maxAttempts})\n`))
+                        await delay(5000)
+                        return requestCode()
+                    } else {
+                        console.error(chalk.red('\n❌ Failed to get pairing code after 3 attempts'))
+                        console.log(chalk.yellow('\n💡 Possible fixes:'))
+                        console.log(chalk.yellow('   • Check your phone has active internet'))
+                        console.log(chalk.yellow('   • Try again in 30 seconds'))
+                        console.log(chalk.yellow('   • Or use QR mode: node index.js --qr\n'))
+                        
+                        if (!botConnected && !isRestarting) {
+                            console.log(chalk.yellow('The bot will continue running and retry periodically...\n'))
+                            await delay(30000)
+                            isRestarting = true
+                            startXeonBotInc()
+                        } else {
+                            console.log(chalk.yellow('Pairing code request will retry automatically (bot is connected)\n'))
+                        }
+                    }
+                    pairingPromptActive = false
+                }
+            }
+
+            // Start the pairing code request after a short delay
+            pairingRequested = true
+            setTimeout(requestCode, 3000)
         }
         
         if (connection === 'connecting') {
@@ -351,8 +634,28 @@ async function startXeonBotInc() {
         }
         
         if (connection == "open") {
+            botConnected = true  // Mark bot as successfully connected
+            isRestarting = false  // Clear restart flag
+            // Clear pairing request state when connection opens
+            pairingRequested = false
+            pairingPromptActive = false
             console.log(chalk.magenta(` `))
-            console.log(chalk.yellow(`🌿Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
+            console.log(chalk.yellow(`🌿 Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
+
+            // Persist session for multi-user support
+            try {
+                const userPhoneNumber = XeonBotInc.user.id.split(':')[0]
+                const currentSessionPath = sessionPath.replace(/\\/g, '/')
+                addOrUpdateSession(userPhoneNumber, currentSessionPath)
+                console.log(chalk.green(`💾 Session persisted for +${userPhoneNumber}`))
+                
+                // Update owner variable to reflect currently connected user
+                owner = userPhoneNumber
+                global.owner = userPhoneNumber
+                console.log(chalk.cyan(`📱 Owner updated to: ${userPhoneNumber}`))
+            } catch (e) {
+                console.error('Error persisting session:', e.message)
+            }
 
             try {
                 const botNumber = XeonBotInc.user.id.split(':')[0] + '@s.whatsapp.net';
@@ -379,36 +682,32 @@ async function startXeonBotInc() {
         }
         
         if (connection === 'close') {
+            botConnected = false  // Mark as disconnected
             const errorObj = lastDisconnect?.error
             const errorStr = String(errorObj || '')
 
             // Explicitly handle Baileys "Stream Errored (conflict)" to avoid rapid reconnect loops
             console.log(chalk.red(`Connection close error string: ${errorStr}`))
             if (errorStr.toLowerCase().includes('conflict') || /stream errored/i.test(errorStr)) {
-                console.error(chalk.red('⚠️ Connection closed: Stream Errored (conflict) — another session is using this account.'))
-                console.error(chalk.red('Please logout other devices or re-authenticate on this server. The bot will stop to avoid repeated reconnects.'))
-                // Try to stop the PM2-managed process to avoid restart loops
-                try {
-                    const { exec } = require('child_process');
-                    exec('pm2 stop x5-bot', (err, stdout, stderr) => {
-                        if (err) {
-                            console.error('Failed to run `pm2 stop x5-bot`:', err);
-                            process.exit(1);
-                        } else {
-                            console.log('pm2: stopped x5-bot to prevent restart loop.');
-                            process.exit(0);
-                        }
-                    });
-                } catch (err) {
-                    console.error('Error attempting to stop pm2:', err);
-                    process.exit(1);
+                // Silently retry on conflict (another session detected)
+                console.log(chalk.yellow('⏳ Reconnecting to WhatsApp (session sync in progress)...'))
+                await delay(3000)
+                // Only restart if not already connected (avoid double restarts)
+                if (!isRestarting && !botConnected) {
+                    isRestarting = true
+                    startXeonBotInc()
                 }
+                return
             }
 
             const shouldReconnect = (errorObj)?.output?.statusCode !== DisconnectReason.loggedOut
             const statusCode = errorObj?.output?.statusCode
 
-            console.log(chalk.red(`Connection closed due to ${errorObj}, reconnecting ${shouldReconnect}`))
+            if (shouldReconnect) {
+                console.log(chalk.yellow('🔄 Connection closed, will auto-reconnect...'))
+            } else {
+                console.log(chalk.red(`Connection closed permanently: ${errorObj}`))
+            }
 
             if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
                 try {
@@ -420,8 +719,9 @@ async function startXeonBotInc() {
                 console.log(chalk.red('Session logged out. Please re-authenticate.'))
             }
 
-            if (shouldReconnect) {
-                console.log(chalk.yellow('Reconnecting...'))
+            if (shouldReconnect && !isRestarting) {
+                console.log(chalk.yellow('⏱️ Waiting 5 seconds before reconnection...'))
+                isRestarting = true
                 await delay(5000)
                 startXeonBotInc()
             }
@@ -594,6 +894,25 @@ async function startXeonBotInc() {
     }
 }
 
+
+// Display startup banner
+console.log(chalk.cyan('\n╔════════════════════════════════════════╗'))
+console.log(chalk.cyan('║          X5 WHATSAPP BOT              ║'))
+console.log(chalk.cyan('╠════════════════════════════════════════╣'))
+console.log(chalk.cyan('║  Choose your connection method:       ║'))
+console.log(chalk.cyan('║                                        ║'))
+
+if (usePairingCode) {
+    console.log(chalk.green('║  ✓ Pairing Code Mode                  ║'))
+} else if (useQR) {
+    console.log(chalk.green('║  ✓ QR Code Mode                       ║'))
+}
+
+console.log(chalk.cyan('║                                        ║'))
+console.log(chalk.cyan('║  To switch modes, use:                 ║'))
+console.log(chalk.cyan('║  • QR Code: node index.js --qr        ║'))
+console.log(chalk.cyan('║  • Pairing: node index.js --pair      ║'))
+console.log(chalk.cyan('╚════════════════════════════════════════╝\n'))
 
 // Start the bot with error handling
 if (process.env.KATABUMP_MODE === '1' || process.env.SKIP_WHATSAPP === '1') {
